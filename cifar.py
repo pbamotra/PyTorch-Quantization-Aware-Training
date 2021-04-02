@@ -310,6 +310,10 @@ def model_equivalence(model_1,
     return True
 
 
+from torch.nn.utils import prune
+import numpy as np
+
+
 def main():
 
     random_seed = 0
@@ -347,8 +351,18 @@ def main():
     model = load_model(model=model,
                        model_filepath=model_filepath,
                        device=cuda_device)
+    
+    model.eval()
+    _, fp32_eval_accuracy = evaluate_model(model=model,
+                                           test_loader=test_loader,
+                                           device=cuda_device,
+                                           criterion=None)
+    
+    print("[Before QAT] FP32 evaluation accuracy: {:.3f}".format(fp32_eval_accuracy))
+    
     # Move the model to CPU since static quantization does not support CUDA currently.
-    model.to(cpu_device)
+    model.to(cpu_device);
+    
     # Make a copy of the model for layer fusion
     fused_model = copy.deepcopy(model)
 
@@ -361,6 +375,7 @@ def main():
     fused_model = torch.quantization.fuse_modules(fused_model,
                                                   [["conv1", "bn1", "relu"]],
                                                   inplace=True)
+    
     for module_name, module in fused_model.named_children():
         if "layer" in module_name:
             for basic_block_name, basic_block in module.named_children():
@@ -372,25 +387,50 @@ def main():
                         torch.quantization.fuse_modules(sub_block,
                                                         [["0", "1"]],
                                                         inplace=True)
-
-    # Print FP32 model.
-    print(model)
-    # Print fused model.
-    print(fused_model)
-
+    
+    for name, module in fused_model.named_modules():
+        # prune 20% of connections in all 2D-conv layers
+        if isinstance(module, torch.nn.Conv2d):
+            prune.l1_unstructured(module, name='weight', amount=0.2)
+        # prune 40% of connections in all linear layers
+        elif isinstance(module, torch.nn.Linear):
+            prune.l1_unstructured(module, name='weight', amount=0.4)
+    
+    
+    for name, module in fused_model.named_modules():
+        # prune 20% of connections in all 2D-conv layers
+        if isinstance(module, torch.nn.Conv2d):
+            prune.remove(module, 'weight')
+        # prune 40% of connections in all linear layers
+        elif isinstance(module, torch.nn.Linear):
+            prune.remove(module, 'weight')
+            
     # Model and fused model should be equivalent.
     model.eval()
     fused_model.eval()
-    assert model_equivalence(
-        model_1=model,
-        model_2=fused_model,
-        device=cpu_device,
-        rtol=1e-03,
-        atol=1e-06,
-        num_tests=100,
-        input_size=(
-            1, 3, 32,
-            32)), "Fused model is not equivalent to the original model!"
+    
+    sp = []
+    
+    for name, module in fused_model.named_modules():
+        # prune 20% of connections in all 2D-conv layers
+        if isinstance(module, torch.nn.Conv2d):
+            sp.append(torch.sum(module.weight == 0) /  float(module.weight.nelement()))
+        # prune 40% of connections in all linear layers
+        elif isinstance(module, torch.nn.Linear):
+            sp.append(torch.sum(module.weight == 0) /  float(module.weight.nelement()))
+            
+    print(f'Sparsity: {np.mean(sp)}')
+    
+#     assert model_equivalence(
+#         model_1=model,
+#         model_2=fused_model,
+#         device=cpu_device,
+#         rtol=1e-03,
+#         atol=1e-06,
+#         num_tests=100,
+#         input_size=(
+#             1, 3, 32,
+#             32)), "Fused model is not equivalent to the original model!"
 
     # Prepare the model for quantization aware training. This inserts observers in
     # the model that will observe activation tensors during calibration.
@@ -422,6 +462,7 @@ def main():
                 device=cuda_device,
                 learning_rate=1e-3,
                 num_epochs=10)
+
     quantized_model.to(cpu_device)
 
     # Using high-level static quantization wrapper
@@ -433,7 +474,7 @@ def main():
     quantized_model.eval()
 
     # Print quantized model.
-    print(quantized_model)
+    print(quantized_model);
 
     # Save quantized model.
     save_torchscript_model(model=quantized_model,
